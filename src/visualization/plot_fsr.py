@@ -12,8 +12,9 @@ plt.rcParams["axes.unicode_minus"] = False
 PORT = "/dev/ttyACM0"
 BAUD = 9600
 WINDOW_SECONDS = 30  # 屏幕上保留最近多少秒的数据
+FORCE_MAX_G = 6000  # 传感器额定量程上限 (RP-C18.3/FSR402)
 
-LINE_RE = re.compile(r"ADC:\s*(\d+)")
+LINE_RE = re.compile(r"F:\s*([\d.]+)g\s*\(([\d.]+)N\)\s*状态:\s*(\S+)")
 
 ser = serial.Serial(PORT, BAUD, timeout=1)
 time.sleep(2)  # 等待 Arduino 复位完成
@@ -25,29 +26,19 @@ start_time = time.time()
 fig, ax = plt.subplots(figsize=(9, 5))
 line, = ax.plot([], [], color="#2b6cb0", linewidth=1.5)
 
-# 压力区间背景色,方便对照 sketch 里的阈值
-ax.axhspan(0, 10, color="#e2e8f0", alpha=0.6, label="无压力 (<10)")
-ax.axhspan(10, 200, color="#c6f6d5", alpha=0.6, label="轻压 (<200)")
-ax.axhspan(200, 500, color="#feebc8", alpha=0.6, label="中等压力 (<500)")
-ax.axhspan(500, 1023, color="#fed7d7", alpha=0.6, label="重压 (>=500)")
+# 压力区间背景色,和 sketch 里的力值阈值对应
+ax.axhspan(0, 20, color="#e2e8f0", alpha=0.6, label="无压力 (<20g)")
+ax.axhspan(20, 1000, color="#c6f6d5", alpha=0.6, label="轻压 (<1000g)")
+ax.axhspan(1000, 3000, color="#feebc8", alpha=0.6, label="中等压力 (<3000g)")
+ax.axhspan(3000, FORCE_MAX_G, color="#fed7d7", alpha=0.6, label="重压 (>=3000g)")
 
 ax.set_xlabel("时间 (秒)")
-ax.set_ylabel("ADC 读数 (0-1023)")
-ax.set_title("FSR 压力传感器实时读数")
-ax.set_ylim(0, 1023)
+ax.set_ylabel("受力 (g)")
+ax.set_title("FSR402 压力传感器实时读数")
+ax.set_ylim(0, FORCE_MAX_G)
 ax.legend(loc="upper right", fontsize=8)
 
 status_text = ax.text(0.02, 0.95, "", transform=ax.transAxes, fontsize=11, va="top")
-
-
-def classify(reading):
-    if reading < 10:
-        return "无压力"
-    elif reading < 200:
-        return "轻压"
-    elif reading < 500:
-        return "中等压力"
-    return "重压"
 
 
 def update(_frame):
@@ -56,11 +47,14 @@ def update(_frame):
         match = LINE_RE.search(raw)
         if not match:
             continue
-        reading = int(match.group(1))
+        grams = float(match.group(1))
+        newtons = float(match.group(2))
+        status = match.group(3)
+        print(raw)
         t = time.time() - start_time
         times.append(t)
-        values.append(reading)
-        status_text.set_text(f"ADC: {reading}   状态: {classify(reading)}")
+        values.append(grams)
+        status_text.set_text(f"F: {grams:.1f}g ({newtons:.2f}N)   状态: {status}")
 
     while times and times[0] < times[-1] - WINDOW_SECONDS:
         times.popleft()
