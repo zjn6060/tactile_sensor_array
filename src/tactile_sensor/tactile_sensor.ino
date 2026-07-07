@@ -1,25 +1,18 @@
-const int FSR_PIN = A0;
+const int FSR_PIN_1 = A0;
+const int FSR_PIN_2 = A1;
 
 void setup() {
   Serial.begin(9600);
 }
 
 void loop() {
-  int reading = analogRead(FSR_PIN);
+  int reading1 = analogRead(FSR_PIN_1);
+  int reading2 = analogRead(FSR_PIN_2);
 
-  Serial.print("ADC: ");
-  Serial.print(reading);
-  Serial.print("  状态: ");
-
-  if (reading < 10) {
-    Serial.println("无压力");
-  } else if (reading < 200) {
-    Serial.println("轻压");
-  } else if (reading < 500) {
-    Serial.println("中等压力");
-  } else {
-    Serial.println("重压");
-  }
+  Serial.print("ADC1: ");
+  Serial.print(reading1);
+  Serial.print("  ADC2: ");
+  Serial.println(reading2);
 
   delay(200);
 }

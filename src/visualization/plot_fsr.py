@@ -2,7 +2,6 @@ import re
 import time
 import collections
 
-import numpy as np
 import serial
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -14,47 +13,37 @@ PORT = "/dev/ttyACM0"
 BAUD = 9600
 WINDOW_SECONDS = 30  # 屏幕上保留最近多少秒的数据
 
-# --- 分压电路参数 ---
-# FSR 一端接 VCC，另一端接 Arduino 模拟口，模拟口再经 R_FIXED_OHMS 接地（下拉）。
-# Vout/Vcc = R_FIXED/(R_FSR+R_FIXED)  =>  R_FSR = R_FIXED*(Vcc/Vout - 1)
-# TODO: 10kΩ 是出厂默认假设值，实测校准后请替换为电路里实际的固定电阻阻值。
-R_FIXED_OHMS = 10_000.0
+# --- 运放反馈式压力传感器模块（AO-RES 增益电位器已手动调过）---
+# 模块电路：U_o = (1 + R_AO-RES/Rx) * 0.1V，其中 F=0 时 Rx->无穷大，
+# U_o 恒为 0.1V（ADC≈20），与增益无关；增益(旋钮)只决定斜率，因此只需一个
+# 已知重量的标定点就能定死整条线。
+# TODO: 旋钮位置改变后（重新调过增益），把下面两个常量换成新的实测点。
+# 两路传感器目前共用同一套标定参数，如果两个模块增益旋钮不一致，需要分别标定。
+VCC = 5.0
 ADC_MAX = 1023
+BASELINE_VOLTAGE = 0.1  # F=0 时的固定输出电压（电路特性，与增益无关）
+CAL_KNOWN_FORCE_G = 251.0   # 标定用已知重量（手机）
+CAL_KNOWN_ADC = 175         # 该重量下调好增益后实测的 ADC 值
 
-# --- FSR402(RP-C18.3) 压力-电阻标定表，0~6kg 量程（来自规格书《RP-C18.3 压力电阻曲线.pdf》，
-# 15mm 硅胶半球头压头测得，厂商拟合 R=153.18*F^-0.699，R²=0.9972）。
-# 100kΩ 处为人为补充的"无接触"锚点（FSR 空载电阻通常 >1MΩ，这里给个远大于首个数据点的值即可）。
-# TODO: 传感器一致性误差较大，厂商建议逐只校准；换成实测数据后替换本表即可。
-_CAL_WEIGHT_G = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100,
-                  1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, 2000, 3000,
-                  4000, 5000, 6000]
-_CAL_RESISTANCE_KOHM = [100, 6.853, 3.733, 2.82, 2.313, 2.02, 1.743, 1.57,
-                         1.42, 1.328, 1.195, 1.104, 1.044, 0.988, 0.948,
-                         0.913, 0.871, 0.837, 0.811, 0.774, 0.744, 0.576,
-                         0.485, 0.4213, 0.3797]
-# np.interp 要求 xp 单调递增，这里按电阻从小到大重新排序（对应重量从大到小）。
-_CAL_R_ASC = list(reversed(_CAL_RESISTANCE_KOHM))
-_CAL_G_DESC = list(reversed(_CAL_WEIGHT_G))
+FORCE_THRESHOLDS_G = (20, 200, 600)  # 无压力/轻压/中等压力/重压 分界（克），按抓握场景设定
 
-FORCE_THRESHOLDS_G = (50, 1000, 3000)  # 无压力/轻压/中等压力/重压 分界（克）
+CHANNELS = ({"label": "通道1 (A0)", "adc_color": "#2b6cb0", "force_color": "#c53030"},
+            {"label": "通道2 (A1)", "adc_color": "#2f855a", "force_color": "#b7791f"})
 
-LINE_RE = re.compile(r"ADC:\s*(\d+)")
+LINE_RE = re.compile(r"ADC1:\s*(\d+)\s+ADC2:\s*(\d+)")
 
 
-def adc_to_resistance_kohm(adc):
-    if adc <= 0:
-        return float("inf")
-    ratio = adc / ADC_MAX
-    r_fsr_ohms = R_FIXED_OHMS * (1 / ratio - 1)
-    return max(r_fsr_ohms, 0.0) / 1000.0
+def adc_to_voltage(adc):
+    return adc / ADC_MAX * VCC
 
 
-def resistance_to_force_g(r_kohm):
-    return float(np.interp(r_kohm, _CAL_R_ASC, _CAL_G_DESC))
+# 由标定点反推斜率：F = (U_o - BASELINE_VOLTAGE) * _FORCE_PER_VOLT
+_FORCE_PER_VOLT = CAL_KNOWN_FORCE_G / (adc_to_voltage(CAL_KNOWN_ADC) - BASELINE_VOLTAGE)
 
 
 def adc_to_force_g(adc):
-    return resistance_to_force_g(adc_to_resistance_kohm(adc))
+    voltage = adc_to_voltage(adc)
+    return max(voltage - BASELINE_VOLTAGE, 0.0) * _FORCE_PER_VOLT
 
 
 def classify_force(force_g):
@@ -72,30 +61,44 @@ ser = serial.Serial(PORT, BAUD, timeout=1)
 time.sleep(2)  # 等待 Arduino 复位完成
 
 times = collections.deque()
-adc_values = collections.deque()
-force_values = collections.deque()
+channel_data = [
+    {"adc": collections.deque(), "force": collections.deque()} for _ in CHANNELS
+]
 start_time = time.time()
 
-fig, (ax_adc, ax_force) = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
+fig, axes = plt.subplots(1, len(CHANNELS), figsize=(14, 6))
 
-adc_line, = ax_adc.plot([], [], color="#2b6cb0", linewidth=1.5)
-ax_adc.set_ylabel("ADC 读数 (0-1023)")
-ax_adc.set_title("FSR 原始 ADC 读数")
-ax_adc.set_ylim(0, 1023)
+adc_lines = []
+force_lines = []
+status_texts = []
+force_axes = []
 
-force_line, = ax_force.plot([], [], color="#c53030", linewidth=1.5)
 low_g, mid_g, high_g = FORCE_THRESHOLDS_G
-ax_force.axhspan(0, low_g, color="#e2e8f0", alpha=0.6, label=f"无压力 (<{low_g}g)")
-ax_force.axhspan(low_g, mid_g, color="#c6f6d5", alpha=0.6, label=f"轻压 (<{mid_g}g)")
-ax_force.axhspan(mid_g, high_g, color="#feebc8", alpha=0.6, label=f"中等压力 (<{high_g}g)")
-ax_force.axhspan(high_g, 6000, color="#fed7d7", alpha=0.6, label=f"重压 (>={high_g}g)")
-ax_force.set_xlabel("时间 (秒)")
-ax_force.set_ylabel("估算压力 (g)")
-ax_force.set_title("换算压力（分段线性标定，未校准，仅供参考）")
-ax_force.set_ylim(0, 6000)
-ax_force.legend(loc="upper right", fontsize=8)
 
-status_text = ax_adc.text(0.02, 0.92, "", transform=ax_adc.transAxes, fontsize=11, va="top")
+for ax, ch in zip(axes, CHANNELS):
+    adc_line, = ax.plot([], [], color=ch["adc_color"], linewidth=1.5, label="ADC 原始读数")
+    ax.set_xlabel("时间 (秒)")
+    ax.set_ylabel("ADC 读数 (0-1023)", color=ch["adc_color"])
+    ax.set_ylim(0, 1023)
+    ax.set_title(ch["label"])
+    ax.tick_params(axis="y", labelcolor=ch["adc_color"])
+
+    force_ax = ax.twinx()
+    force_ax.axhspan(0, low_g, color="#e2e8f0", alpha=0.4)
+    force_ax.axhspan(low_g, mid_g, color="#c6f6d5", alpha=0.4)
+    force_ax.axhspan(mid_g, high_g, color="#feebc8", alpha=0.4)
+    force_ax.axhspan(high_g, 1100, color="#fed7d7", alpha=0.4)
+    force_line, = force_ax.plot([], [], color=ch["force_color"], linewidth=1.5, label="估算压力 (g)")
+    force_ax.set_ylabel("估算压力 (g)", color=ch["force_color"])
+    force_ax.set_ylim(0, 1100)
+    force_ax.tick_params(axis="y", labelcolor=ch["force_color"])
+
+    status_text = ax.text(0.02, 0.92, "", transform=ax.transAxes, fontsize=10, va="top")
+
+    adc_lines.append(adc_line)
+    force_lines.append(force_line)
+    force_axes.append(force_ax)
+    status_texts.append(status_text)
 
 
 def update(_frame):
@@ -104,29 +107,40 @@ def update(_frame):
         match = LINE_RE.search(raw)
         if not match:
             continue
-        adc = int(match.group(1))
-        force_g = adc_to_force_g(adc)
+        adcs = (int(match.group(1)), int(match.group(2)))
 
         t = time.time() - start_time
         times.append(t)
-        adc_values.append(adc)
-        force_values.append(force_g)
-        status_text.set_text(
-            f"ADC: {adc}   估算压力: {force_g:.0f}g   状态: {classify_force(force_g)}"
-        )
+        for data, adc in zip(channel_data, adcs):
+            data["adc"].append(adc)
+            data["force"].append(adc_to_force_g(adc))
+
+        for i, (ch, data, adc) in enumerate(zip(CHANNELS, channel_data, adcs)):
+            force_g = data["force"][-1]
+            status_texts[i].set_text(
+                f"ADC: {adc}   估算压力: {force_g:.0f}g   状态: {classify_force(force_g)}"
+            )
 
     while times and times[0] < times[-1] - WINDOW_SECONDS:
         times.popleft()
-        adc_values.popleft()
-        force_values.popleft()
+        for data in channel_data:
+            data["adc"].popleft()
+            data["force"].popleft()
 
-    adc_line.set_data(times, adc_values)
-    force_line.set_data(times, force_values)
+    for i, data in enumerate(channel_data):
+        adc_lines[i].set_data(times, data["adc"])
+        force_lines[i].set_data(times, data["force"])
+        if data["force"]:
+            # 跟着当前窗口内的读数动态放大坐标轴，方便看清细节，同时不超过标定量程上限。
+            y_max = min(max(data["force"]) * 1.3, 1100)
+            force_axes[i].set_ylim(0, max(y_max, 100))
+
     if times:
         xlim = (max(0, times[-1] - WINDOW_SECONDS), max(WINDOW_SECONDS, times[-1]))
-        ax_adc.set_xlim(*xlim)
-        ax_force.set_xlim(*xlim)
-    return adc_line, force_line, status_text
+        for ax in axes:
+            ax.set_xlim(*xlim)
+
+    return (*adc_lines, *force_lines, *status_texts)
 
 
 ani = animation.FuncAnimation(fig, update, interval=200, cache_frame_data=False)
