@@ -1,0 +1,14 @@
+channels:
+- label: A1
+  ref_weight_g: 3646.0
+  adc_full_scale: 571.5
+  adc_baseline: 19.8
+digital_channels:
+- label: A0
+  threshold_force_g: 55.0
+  do_triggered_at_threshold: true
+  do_low_at_zero_force: true
+- label: A1
+  threshold_force_g: 57.0
+  do_triggered_at_threshold: true
+  do_low_at_zero_force: true
